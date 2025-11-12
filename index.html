@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>授業交換候補表示（同一クラス限定）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    h1 { font-size: 1.3rem; }
+    label { display:block; margin-top:1rem; }
+    select,input { padding:4px; }
+    table { border-collapse:collapse; margin-top:1rem; width:100%; max-width:1000px; }
+    th,td { border:1px solid #ccc; padding:4px 6px; font-size:0.8rem; }
+    .muted { color:#777; font-size:0.8rem; }
+  </style>
+</head>
+<body>
+  <h1>授業交換候補表示（同一クラス限定）</h1>
+  <p class="muted">
+    CSV列: teacher,grade,class,course,day,period,subject,group<br>
+    1年=1〜9組, 2年=1〜8組, 3年=1〜9組。<br>
+    交換条件: 「相互に相手の時間に授業がない」かつ「同一学年・同一クラス（2・3年はコースも一致）」。
+  </p>
+
+  <label>CSVを読み込む: <input type="file" id="fileInput" accept=".csv"></label>
+
+  <label>教員:
+    <select id="teacherSelect" disabled>
+      <option value="">先にCSVを読み込んでください</option>
+    </select>
+  </label>
+
+  <label>授業（コマ）:
+    <select id="lessonSelect" disabled>
+      <option value="">先に教員を選んでください</option>
+    </select>
+  </label>
+
+  <div id="results" class="muted" style="margin-top:1.5rem;">
+    まだ選択されていません。
+  </div>
+
+  <script>
+    const CLASS_LIMITS = { 1: 9, 2: 8, 3: 9 };
+    const VALID_DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat"];
+    const DAY_JA = {Mon:"月", Tue:"火", Wed:"水", Thu:"木", Fri:"金", Sat:"土"};
+    const ORD = {1:"1st",2:"2nd",3:"3rd",4:"4th",5:"5th",6:"6th",7:"7th"};
+
+    let lessons = [];
+    let teachers = [];
+
+    const fileInput = document.getElementById('fileInput');
+    const teacherSelect = document.getElementById('teacherSelect');
+    const lessonSelect = document.getElementById('lessonSelect');
+    const resultsDiv = document.getElementById('results');
+
+    function parseCSV(text){
+      return text.trim().split(/\r?\n/).map(l=>l.split(',').map(s=>s.trim()));
+    }
+
+    function normalizeCourse(c){
+      if (!c) return "";
+      if (c === "文系") return "文系";
+      if (c === "理系") return "理系";
+      return c;
+    }
+
+    // 教員がその曜日・時限に授業を持っているか（学年・クラスは見ない）
+    function teacherHasSlot(teacher, day, period){
+      return lessons.some(l => l.teacher === teacher && l.day === day && l.period === period);
+    }
+
+    function formatSlot(day, period){
+      const d = DAY_JA[day] || day;
+      const p = ORD[period] || (period + "限");
+      return d + p;
+    }
+
+    // 同一クラス判定（2・3年はコースも一致）
+    function sameClassAndCourse(a, b){
+      if (a.grade !== b.grade) return false;
+      if (a.class !== b.class) return false;
+      if (a.grade >= 2) {
+        const ca = a.course || "";
+        const cb = b.course || "";
+        if (ca !== cb) return false;
+      }
+      return true;
+    }
+
+    fileInput.addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = evt => {
+        const data = parseCSV(evt.target.result);
+        const h = data[0];
+        const iT = h.indexOf('teacher');
+        const iG = h.indexOf('grade');
+        const iC = h.indexOf('class');
+        const iCourse = h.indexOf('course');
+        const iD = h.indexOf('day');
+        const iP = h.indexOf('period');
+        const iS = h.indexOf('subject');
+        const iGrp = h.indexOf('group');
+
+        lessons = data.slice(1).map(r => {
+          const grade = Number(r[iG]);
+          const periodNum = parseInt(r[iP], 10);
+          return {
+            teacher: r[iT],
+            grade: grade,
+            class: Number(r[iC]),
+            course: normalizeCourse(r[iCourse]),
+            day: r[iD],
+            period: periodNum,
+            subject: r[iS],
+            group: r[iGrp] || ""
+          };
+        }).filter(l => {
+          if (![1,2,3].includes(l.grade)) return false;
+          const limit = CLASS_LIMITS[l.grade];
+          if (!limit || l.class < 1 || l.class > limit) return false;
+          if (!VALID_DAYS.includes(l.day)) return false;
+          if (Number.isNaN(l.period) || l.period < 1 || l.period > 7) return false;
+          return true;
+        });
+
+        teachers = [...new Set(lessons.map(l => l.teacher))].filter(Boolean);
+        teacherSelect.innerHTML = '<option value="">教員を選択</option>';
+        teachers.forEach(t => {
+          const op = document.createElement('option');
+          op.value = t;
+          op.textContent = t;
+          teacherSelect.appendChild(op);
+        });
+        teacherSelect.disabled = false;
+        lessonSelect.disabled = true;
+        lessonSelect.innerHTML = '<option value="">先に教員を選んでください</option>';
+        resultsDiv.textContent = "教員と授業を選ぶと交換候補を表示します。";
+      };
+      reader.readAsText(file, 'UTF-8');
+    });
+
+    teacherSelect.addEventListener('change', e => {
+      const name = e.target.value;
+      if (!name) { lessonSelect.disabled = true; return; }
+      const myLessons = lessons.filter(l => l.teacher === name);
+      lessonSelect.innerHTML = '<option value="">授業を選択</option>';
+      myLessons.forEach(l => {
+        const op = document.createElement('option');
+        op.value = lessons.indexOf(l);
+        const slot = formatSlot(l.day, l.period);
+        const courseText = l.grade >= 2 ? ` ${l.course || "(コース未指定)"}` : '';
+        op.textContent = `${slot} ${l.grade}年${l.class}組${courseText} ${l.subject}${l.group ? ' [合同:'+l.group+']' : ''}`;
+        lessonSelect.appendChild(op);
+      });
+      lessonSelect.disabled = false;
+      resultsDiv.textContent = "交換したい授業を選択してください。";
+    });
+
+    lessonSelect.addEventListener('change', e => {
+      const idx = Number(e.target.value);
+      if (Number.isNaN(idx)) { resultsDiv.textContent = "授業を選んでください。"; return; }
+
+      const me = lessons[idx];
+      const myTeacher = me.teacher;
+      const myDay = me.day;
+      const myPeriod = me.period;
+
+      const candidates = [];
+
+      lessons.forEach(other => {
+        if (other.teacher === myTeacher) return;                 // 同一教員は除外
+        if (!sameClassAndCourse(me, other)) return;              // 同一学年・クラス（2・3年はコース一致）に限定
+
+        // 相互に空きか（= 相手の時間に自分が授業を持たない & 自分の時間に相手が授業を持たない）
+        const iBusyAtOther = teacherHasSlot(myTeacher, other.day, other.period);
+        const otherBusyAtMine = teacherHasSlot(other.teacher, myDay, myPeriod);
+        if (iBusyAtOther) return;
+        if (otherBusyAtMine) return;
+
+        candidates.push(other);
+      });
+
+      if (!candidates.length) {
+        resultsDiv.innerHTML = "<p>交換できる候補はありません。</p>";
+        return;
+      }
+
+      const tbl = document.createElement('table');
+      tbl.innerHTML = "<thead><tr><th>相手教員</th><th>相手の授業</th><th>あなたの授業</th></tr></thead>";
+      const tb = document.createElement('tbody');
+
+      candidates.forEach(c => {
+        const otherSlot = formatSlot(c.day, c.period);
+        const mySlot = formatSlot(myDay, myPeriod);
+        const cCourse = c.grade >= 2 ? ` ${c.course || "(コース未指定)"}` : '';
+        const myCourse = me.grade >= 2 ? ` ${me.course || "(コース未指定)"}` : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${c.teacher}</td>
+          <td>${otherSlot} ${c.grade}年${c.class}組${cCourse} ${c.subject}${c.group ? ' [合同:'+c.group+']' : ''}</td>
+          <td>${mySlot} ${me.grade}年${me.class}組${myCourse} ${me.subject}${me.group ? ' [合同:'+me.group+']' : ''}</td>
+        `;
+        tb.appendChild(tr);
+      });
+
+      tbl.appendChild(tb);
+      resultsDiv.innerHTML = "";
+      resultsDiv.appendChild(tbl);
+    });
+  </script>
+</body>
+</html>
