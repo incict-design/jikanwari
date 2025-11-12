@@ -1,32 +1,36 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <title>授業交換候補表示（同一クラス限定）</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="UTF-8" />
+  <title>授業交換候補表示（teacher_1..4対応）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    h1 { font-size: 1.3rem; }
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    h1 { font-size: 1.2rem; }
     label { display:block; margin-top:1rem; }
     select,input { padding:4px; }
-    table { border-collapse:collapse; margin-top:1rem; width:100%; max-width:1000px; }
-    th,td { border:1px solid #ccc; padding:4px 6px; font-size:0.8rem; }
-    .muted { color:#777; font-size:0.8rem; }
+    table { border-collapse:collapse; margin-top:1rem; width:100%; max-width:1200px; }
+    th,td { border:1px solid #ccc; padding:6px 8px; font-size:0.9rem; text-align:left; }
+    .muted { color:#777; font-size:0.85rem; }
+    .training-conflict { color: red; font-weight: 700; }
+    .parttime-row { color: blue; font-weight: 700; }
   </style>
 </head>
 <body>
-  <h1>授業交換候補表示（同一クラス限定）</h1>
+  <h1>授業交換候補表示（teacher_1..4対応＋研修am/pm＋非常勤）</h1>
   <p class="muted">
-    CSV列: teacher,grade,class,course,day,period,subject,group<br>
-    1年=1〜9組, 2年=1〜8組, 3年=1〜9組。<br>
-    交換条件: 「相互に相手の時間に授業がない」かつ「同一学年・同一クラス（2・3年はコースも一致）」。
+    授業CSV（固定列順）:<br>
+    <code>grade,class,course,day,period,subject,group,teacher_1,teacher_2,teacher_3,teacher_4</code><br>
+    研修CSV（任意）:<br>
+    <code>teacher,day,slot,detail,parttime</code>（slot=am/pm, parttime=Yes/No。未掲載教員は非常勤扱い）
   </p>
 
-  <label>CSVを読み込む: <input type="file" id="fileInput" accept=".csv"></label>
+  <label>授業CSVを読み込む: <input type="file" id="fileLessons" accept=".csv" /></label>
+  <label>研修CSVを読み込む（任意）: <input type="file" id="fileTrainings" accept=".csv" /></label>
 
   <label>教員:
     <select id="teacherSelect" disabled>
-      <option value="">先にCSVを読み込んでください</option>
+      <option value="">先に授業CSVを読み込んでください</option>
     </select>
   </label>
 
@@ -36,102 +40,136 @@
     </select>
   </label>
 
-  <div id="results" class="muted" style="margin-top:1.5rem;">
-    まだ選択されていません。
-  </div>
+  <div id="results" class="muted" style="margin-top:1.2rem;">まだ選択されていません。</div>
 
   <script>
     const CLASS_LIMITS = { 1: 9, 2: 8, 3: 9 };
-    const VALID_DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat"];
-    const DAY_JA = {Mon:"月", Tue:"火", Wed:"水", Thu:"木", Fri:"金", Sat:"土"};
+    const DAY_MAP_IN = {
+      "mon":"Mon","monday":"Mon","月":"Mon",
+      "tue":"Tue","tuesday":"Tue","火":"Tue",
+      "wed":"Wed","wednesday":"Wed","水":"Wed",
+      "thu":"Thu","thursday":"Thu","木":"Thu",
+      "fri":"Fri","friday":"Fri","金":"Fri",
+      "sat":"Sat","saturday":"Sat","土":"Sat"
+    };
+    const DAY_JA_OUT = {Mon:"月", Tue:"火", Wed:"水", Thu:"木", Fri:"金", Sat:"土"};
     const ORD = {1:"1st",2:"2nd",3:"3rd",4:"4th",5:"5th",6:"6th",7:"7th"};
 
-    let lessons = [];
+    let lessons = [];                 // 展開後: {teacher,grade,class,course,day,period,subject,group}
     let teachers = [];
+    let trainings = [];               // {teacher,day,slot,detail,parttime}
+    let trainingTeachers = new Set(); // 研修CSVに登場した教員
+    let teacherParttimeMap = new Map();
 
-    const fileInput = document.getElementById('fileInput');
+    const fileLessons = document.getElementById('fileLessons');
+    const fileTrainings = document.getElementById('fileTrainings');
     const teacherSelect = document.getElementById('teacherSelect');
     const lessonSelect = document.getElementById('lessonSelect');
     const resultsDiv = document.getElementById('results');
 
     function parseCSV(text){
-      return text.trim().split(/\r?\n/).map(l=>l.split(',').map(s=>s.trim()));
+      return text.replace(/^\uFEFF/, '').trim().split(/\r?\n/).map(l=>l.split(',').map(s=>s.trim()));
     }
-
+    function normalizeDay(d){
+      if (!d) return "";
+      const k = String(d).toLowerCase();
+      return DAY_MAP_IN[k] || d;
+    }
+    function parsePeriod(p){
+      if (p == null) return NaN;
+      const m = String(p).match(/\d+/);
+      return m ? parseInt(m[0],10) : NaN;
+    }
     function normalizeCourse(c){
       if (!c) return "";
-      if (c === "文系") return "文系";
-      if (c === "理系") return "理系";
-      return c;
+      const s = String(c).trim();
+      const low = s.toLowerCase();
+      if (["文系","humanities","arts","h"].includes(low)) return "文系";
+      if (["理系","science","sci","s"].includes(low)) return "理系";
+      return s;
     }
-
-    // 教員がその曜日・時限に授業を持っているか（学年・クラスは見ない）
+    function periodToSlot(period){ return period <= 4 ? "am" : "pm"; }
     function teacherHasSlot(teacher, day, period){
       return lessons.some(l => l.teacher === teacher && l.day === day && l.period === period);
     }
-
+    function sameClassAndCourse(a,b){
+      if (a.grade !== b.grade) return false;
+      if (a.class !== b.class) return false;
+      if (a.grade >= 2 && (a.course||"") !== (b.course||"")) return false;
+      return true;
+    }
     function formatSlot(day, period){
-      const d = DAY_JA[day] || day;
+      const d = DAY_JA_OUT[day] || day;
       const p = ORD[period] || (period + "限");
       return d + p;
     }
-
-    // 同一クラス判定（2・3年はコースも一致）
-    function sameClassAndCourse(a, b){
-      if (a.grade !== b.grade) return false;
-      if (a.class !== b.class) return false;
-      if (a.grade >= 2) {
-        const ca = a.course || "";
-        const cb = b.course || "";
-        if (ca !== cb) return false;
-      }
-      return true;
+    function findTraining(teacher, day, slot){
+      return trainings.find(t => t.teacher === teacher && t.day === day && t.slot === slot);
+    }
+    function isParttimeTeacher(teacher){
+      if (!trainingTeachers.has(teacher)) return true; // 研修CSV未掲載なら非常勤
+      return !!teacherParttimeMap.get(teacher);        // 掲載ありはparttime列で
     }
 
-    fileInput.addEventListener('change', e => {
-      const file = e.target.files[0];
-      if (!file) return;
+    // ===== 授業CSV読み込み（grade,class,course,day,period,subject,group,teacher_1..4）=====
+    function loadLessons(file){
       const reader = new FileReader();
       reader.onload = evt => {
         const data = parseCSV(evt.target.result);
-        const h = data[0];
-        const iT = h.indexOf('teacher');
-        const iG = h.indexOf('grade');
-        const iC = h.indexOf('class');
-        const iCourse = h.indexOf('course');
-        const iD = h.indexOf('day');
-        const iP = h.indexOf('period');
-        const iS = h.indexOf('subject');
-        const iGrp = h.indexOf('group');
+        if (data.length < 2){ resultsDiv.textContent = "授業CSVが空です。"; return; }
+        const header = data[0].map(h=>h.toLowerCase());
 
-        lessons = data.slice(1).map(r => {
-          const grade = Number(r[iG]);
-          const periodNum = parseInt(r[iP], 10);
-          return {
-            teacher: r[iT],
-            grade: grade,
-            class: Number(r[iC]),
-            course: normalizeCourse(r[iCourse]),
-            day: r[iD],
-            period: periodNum,
-            subject: r[iS],
-            group: r[iGrp] || ""
-          };
-        }).filter(l => {
-          if (![1,2,3].includes(l.grade)) return false;
-          const limit = CLASS_LIMITS[l.grade];
-          if (!limit || l.class < 1 || l.class > limit) return false;
-          if (!VALID_DAYS.includes(l.day)) return false;
-          if (Number.isNaN(l.period) || l.period < 1 || l.period > 7) return false;
-          return true;
+        // 固定列の位置
+        const iGrade = header.indexOf('grade');
+        const iClass = header.indexOf('class');
+        const iCourse = header.indexOf('course');
+        const iDay = header.indexOf('day');
+        const iPeriod = header.indexOf('period');
+        const iSubject = header.indexOf('subject');
+        const iGroup = header.indexOf('group');
+        const iT1 = header.indexOf('teacher_1');
+        const iT2 = header.indexOf('teacher_2');
+        const iT3 = header.indexOf('teacher_3');
+        const iT4 = header.indexOf('teacher_4');
+
+        const req = [iGrade,iClass,iDay,iPeriod,iSubject,iGroup,iT1,iT2,iT3,iT4];
+        if (req.some(i=>i<0)){ resultsDiv.textContent = "授業CSVの列名が仕様と一致しません。"; return; }
+
+        // 行→teacher_1..4を展開
+        const expanded = [];
+        data.slice(1).forEach(r=>{
+          const grade = Number(r[iGrade]);
+          const cls = Number(r[iClass]);
+          const course = normalizeCourse(r[iCourse]);
+          const day = normalizeDay(r[iDay]);
+          const period = parsePeriod(r[iPeriod]);
+          const subject = r[iSubject];
+          const group = r[iGroup] || "";
+
+          const baseValid =
+            [1,2,3].includes(grade) &&
+            CLASS_LIMITS[grade] && cls>=1 && cls<=CLASS_LIMITS[grade] &&
+            ["Mon","Tue","Wed","Thu","Fri","Sat"].includes(day) &&
+            !Number.isNaN(period) && period>=1 && period<=7;
+
+          if (!baseValid) return;
+
+          [iT1,iT2,iT3,iT4].forEach(iT=>{
+            const teacher = r[iT];
+            if (teacher && teacher.trim()){
+              expanded.push({ teacher, grade, class:cls, course, day, period, subject, group });
+            }
+          });
         });
 
-        teachers = [...new Set(lessons.map(l => l.teacher))].filter(Boolean);
+        lessons = expanded;
+
+        // 教員プルダウン
+        teachers = [...new Set(lessons.map(l=>l.teacher))].filter(Boolean);
         teacherSelect.innerHTML = '<option value="">教員を選択</option>';
-        teachers.forEach(t => {
-          const op = document.createElement('option');
-          op.value = t;
-          op.textContent = t;
+        teachers.forEach(t=>{
+          const op=document.createElement('option');
+          op.value=t; op.textContent=t;
           teacherSelect.appendChild(op);
         });
         teacherSelect.disabled = false;
@@ -139,70 +177,119 @@
         lessonSelect.innerHTML = '<option value="">先に教員を選んでください</option>';
         resultsDiv.textContent = "教員と授業を選ぶと交換候補を表示します。";
       };
-      reader.readAsText(file, 'UTF-8');
-    });
+      reader.readAsText(file,'UTF-8');
+    }
 
+    // ===== 研修CSV（teacher,day,slot,detail,parttime）=====
+    function loadTrainings(file){
+      const reader = new FileReader();
+      reader.onload = evt => {
+        const data = parseCSV(evt.target.result);
+        if (data.length < 2){ trainings=[]; trainingTeachers=new Set(); teacherParttimeMap=new Map(); return; }
+        const h = data[0].map(x=>x.toLowerCase());
+        const iT = h.indexOf('teacher');
+        const iD = h.indexOf('day');
+        const iSlot = h.indexOf('slot');
+        const iDetail = h.indexOf('detail');
+        const iPart = h.indexOf('parttime');
+        if (iT<0 || iD<0 || iSlot<0){ trainings=[]; trainingTeachers=new Set(); teacherParttimeMap=new Map(); return; }
+
+        trainings = data.slice(1).map(r => ({
+          teacher: r[iT],
+          day: normalizeDay(r[iD]),
+          slot: (r[iSlot]||"").toLowerCase(),
+          detail: iDetail>=0 ? r[iDetail] : "",
+          parttime: iPart>=0 ? (String(r[iPart]).toLowerCase()==="yes") : false
+        })).filter(t =>
+          t.teacher && ["Mon","Tue","Wed","Thu","Fri","Sat"].includes(t.day) &&
+          (t.slot==="am" || t.slot==="pm")
+        );
+
+        trainingTeachers = new Set(trainings.map(t=>t.teacher));
+        teacherParttimeMap = new Map();
+        trainings.forEach(t=>{
+          teacherParttimeMap.set(t.teacher, (teacherParttimeMap.get(t.teacher)||false) || t.parttime);
+        });
+      };
+      reader.readAsText(file,'UTF-8');
+    }
+
+    fileLessons.addEventListener('change', e => { const f=e.target.files[0]; if(f) loadLessons(f); });
+    fileTrainings.addEventListener('change', e => { const f=e.target.files[0]; if(f) loadTrainings(f); });
+
+    // ===== UI =====
     teacherSelect.addEventListener('change', e => {
       const name = e.target.value;
       if (!name) { lessonSelect.disabled = true; return; }
-      const myLessons = lessons.filter(l => l.teacher === name);
+      const myLessons = lessons.filter(l=>l.teacher===name);
       lessonSelect.innerHTML = '<option value="">授業を選択</option>';
-      myLessons.forEach(l => {
-        const op = document.createElement('option');
+      myLessons.forEach(l=>{
+        const op=document.createElement('option');
         op.value = lessons.indexOf(l);
-        const slot = formatSlot(l.day, l.period);
-        const courseText = l.grade >= 2 ? ` ${l.course || "(コース未指定)"}` : '';
-        op.textContent = `${slot} ${l.grade}年${l.class}組${courseText} ${l.subject}${l.group ? ' [合同:'+l.group+']' : ''}`;
+        const slot = formatSlot(l.day,l.period);
+        const courseText = l.grade>=2 ? ` ${l.course||"(コース未指定)"}` : '';
+        op.textContent = `${slot} ${l.grade}年${l.class}組${courseText} ${l.subject}${l.group?' [合同:'+l.group+']':''}`;
         lessonSelect.appendChild(op);
       });
       lessonSelect.disabled = false;
       resultsDiv.textContent = "交換したい授業を選択してください。";
     });
 
+    // ===== 候補表示 =====
     lessonSelect.addEventListener('change', e => {
       const idx = Number(e.target.value);
       if (Number.isNaN(idx)) { resultsDiv.textContent = "授業を選んでください。"; return; }
 
       const me = lessons[idx];
-      const myTeacher = me.teacher;
       const myDay = me.day;
       const myPeriod = me.period;
+      const mySlot = periodToSlot(myPeriod);
 
       const candidates = [];
+      lessons.forEach(other=>{
+        if (other.teacher === me.teacher) return;
+        if (!sameClassAndCourse(me, other)) return;
 
-      lessons.forEach(other => {
-        if (other.teacher === myTeacher) return;                 // 同一教員は除外
-        if (!sameClassAndCourse(me, other)) return;              // 同一学年・クラス（2・3年はコース一致）に限定
-
-        // 相互に空きか（= 相手の時間に自分が授業を持たない & 自分の時間に相手が授業を持たない）
-        const iBusyAtOther = teacherHasSlot(myTeacher, other.day, other.period);
+        // 教員単位の衝突チェック（相互）
+        const iBusyAtOther = teacherHasSlot(me.teacher, other.day, other.period);
         const otherBusyAtMine = teacherHasSlot(other.teacher, myDay, myPeriod);
-        if (iBusyAtOther) return;
-        if (otherBusyAtMine) return;
+        if (iBusyAtOther || otherBusyAtMine) return;
 
-        candidates.push(other);
+        const trainingInfo = findTraining(other.teacher, myDay, mySlot);
+        const trainingOverlap = !!trainingInfo;
+        const parttimeFlag = isParttimeTeacher(other.teacher);
+
+        candidates.push({ other, trainingOverlap, parttime: parttimeFlag });
       });
 
-      if (!candidates.length) {
+      if (!candidates.length){
         resultsDiv.innerHTML = "<p>交換できる候補はありません。</p>";
         return;
       }
 
       const tbl = document.createElement('table');
-      tbl.innerHTML = "<thead><tr><th>相手教員</th><th>相手の授業</th><th>あなたの授業</th></tr></thead>";
+      tbl.innerHTML = "<thead><tr><th>相手教員</th><th>相手の授業</th><th>あなたの授業</th><th>相手の研修日</th><th>非常勤講師</th></tr></thead>";
       const tb = document.createElement('tbody');
 
-      candidates.forEach(c => {
-        const otherSlot = formatSlot(c.day, c.period);
-        const mySlot = formatSlot(myDay, myPeriod);
-        const cCourse = c.grade >= 2 ? ` ${c.course || "(コース未指定)"}` : '';
-        const myCourse = me.grade >= 2 ? ` ${me.course || "(コース未指定)"}` : '';
+      candidates.forEach(c=>{
+        const o = c.other;
+        const otherSlot = formatSlot(o.day,o.period);
+        const mySlotDisp = formatSlot(myDay,myPeriod);
+        const oCourse = o.grade>=2 ? ` ${o.course||"(コース未指定)"}` : '';
+        const myCourse = me.grade>=2 ? ` ${me.course||"(コース未指定)"}` : '';
+        const markTraining = c.trainingOverlap ? "〇" : "";
+        const markPart = c.parttime ? "〇" : "";
+
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td>${c.teacher}</td>
-          <td>${otherSlot} ${c.grade}年${c.class}組${cCourse} ${c.subject}${c.group ? ' [合同:'+c.group+']' : ''}</td>
-          <td>${mySlot} ${me.grade}年${me.class}組${myCourse} ${me.subject}${me.group ? ' [合同:'+me.group+']' : ''}</td>
+          <td>${o.teacher}</td>
+          <td>${otherSlot} ${o.grade}年${o.class}組${oCourse} ${o.subject}${o.group?' [合同:'+o.group+']':''}</td>
+          <td>${mySlotDisp} ${me.grade}年${me.class}組${myCourse} ${me.subject}${me.group?' [合同:'+me.group+']':''}</td>
+          <td style="text-align:center;">${markTraining}</td>
+          <td style="text-align:center;">${markPart}</td>
         `;
+        if (c.trainingOverlap) tr.classList.add("training-conflict");
+        else if (c.parttime) tr.classList.add("parttime-row");
         tb.appendChild(tr);
       });
 
@@ -213,3 +300,4 @@
   </script>
 </body>
 </html>
+
